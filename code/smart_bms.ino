@@ -54,6 +54,15 @@ unsigned long lastSample = 0;
 float prevVoltage = 0.0;
 int risingCount = 0;
 
+// Fault protection
+bool faultLatched = false;
+bool faultUnderVoltage = false;
+bool faultOverCurrent = false;
+bool faultOverTemp = false;
+float lastVoltage = 0.0;
+float lastCurrent_mA = 0.0;
+float lastTempC = 0.0;
+
 // ── OCV Table ────────────────────────────────
 const float ocvTable[][2] = {
     {3.00, 0}, {3.20, 5}, {3.40, 15}, {3.60, 30}, {3.70, 45}, {3.80, 60}, {3.90, 75}, {4.00, 88}, {4.10, 95}, {4.20, 100}};
@@ -185,15 +194,48 @@ void loop()
 
         if (cmd == 'D' || cmd == 'd')
         {
-            discharging = true;
-            capacitymAh = 0;
-            risingCount = 0;
-            digitalWrite(MOSFET_PIN, LOW);
+            if (faultLatched)
+            {
+                Serial.println("Discharge blocked: fault latched. Send 'C' to clear.");
+            }
+            else
+            {
+                discharging = true;
+                capacitymAh = 0;
+                risingCount = 0;
+                digitalWrite(MOSFET_PIN, LOW);
+            }
         }
         else if (cmd == 'S' || cmd == 's')
         {
             discharging = false;
             digitalWrite(MOSFET_PIN, HIGH);
+        }
+        else if (cmd == 'C' || cmd == 'c')
+        {
+            if (!faultLatched)
+            {
+                Serial.println("No fault latched.");
+            }
+            else
+            {
+                bool stillUnderVoltage = (lastVoltage < CUTOFF_VOLTAGE);
+                bool stillOverCurrent = (abs(lastCurrent_mA) > MAX_CURRENT);
+                bool stillOverTemp = (lastTempC > MAX_TEMP);
+
+                if (stillUnderVoltage || stillOverCurrent || stillOverTemp)
+                {
+                    Serial.println("Fault NOT cleared: condition still present.");
+                }
+                else
+                {
+                    faultLatched = false;
+                    faultUnderVoltage = false;
+                    faultOverCurrent = false;
+                    faultOverTemp = false;
+                    Serial.println("Fault cleared.");
+                }
+            }
         }
     }
 
@@ -209,6 +251,34 @@ void loop()
 
         sensors.requestTemperatures();
         float tempC = sensors.getTempCByIndex(0);
+
+        lastVoltage = batteryVoltage;
+        lastCurrent_mA = current_mA;
+        lastTempC = tempC;
+
+        // Safety threshold enforcement
+        if (!faultLatched)
+        {
+            faultUnderVoltage = (batteryVoltage < CUTOFF_VOLTAGE);
+            faultOverCurrent = (abs(current_mA) > MAX_CURRENT);
+            faultOverTemp = (tempC > MAX_TEMP);
+
+            if (faultUnderVoltage || faultOverCurrent || faultOverTemp)
+            {
+                faultLatched = true;
+                discharging = false;
+                digitalWrite(MOSFET_PIN, HIGH); // force safe state
+
+                Serial.print("FAULT LATCHED:");
+                if (faultUnderVoltage)
+                    Serial.print(" UNDERVOLTAGE");
+                if (faultOverCurrent)
+                    Serial.print(" OVERCURRENT");
+                if (faultOverTemp)
+                    Serial.print(" OVERTEMP");
+                Serial.println();
+            }
+        }
 
         // Charging detection
         bool isCharging = false;
@@ -269,6 +339,11 @@ void loop()
 
         display.print("SoC: ");
         display.println(socFiltered);
+
+        if (faultLatched)
+        {
+            display.println("FAULT LATCHED");
+        }
 
         display.display();
     }
