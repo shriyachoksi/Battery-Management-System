@@ -40,7 +40,7 @@ char pass[] = "WIFI_PASSWORD"; // WRITE
 
 // ── Variables ────────────────────────────────
 float capacitymAh = 0.0;
-float soh = 100.0;
+// float soh = 100.0;
 float soc = 50.0;
 float socFiltered = 50.0;
 
