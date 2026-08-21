@@ -48,7 +48,16 @@ bool discharging = false;
 bool cycleComplete = false;
 bool socInitialized = false;
 
-unsigned long lastSample = 0;
+// Hardware timer sampling (replaces millis()-based polling)
+hw_timer_t *sampleTimer = NULL;
+volatile SemaphoreHandle_t sampleTimerSemaphore;
+portMUX_TYPE sampleTimerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t sampleIsrCount = 0;
+
+// Sampling jitter tracking (evidence: actual vs expected SAMPLE_INTERVAL)
+unsigned long lastFireMillis = 0;
+long maxJitterMs = 0;
+unsigned long samplesProcessed = 0;
 
 // Charging detection
 float prevVoltage = 0.0;
@@ -86,6 +95,19 @@ float ocvToSoC(float voltage)
         }
     }
     return 50.0;
+}
+
+// ── Sample Timer ISR ──────────────────────────
+// Runs in hardirq context: keep minimal, no I2C/1-Wire here (both are
+// blocking bus transactions and unsafe to run inside an ISR). The ISR only
+// increments a counter and signals loop() via semaphore; the actual sensor
+// reads happen in loop() when the semaphore is taken.
+void ARDUINO_ISR_ATTR onSampleTimer()
+{
+    portENTER_CRITICAL_ISR(&sampleTimerMux);
+    sampleIsrCount++;
+    portEXIT_CRITICAL_ISR(&sampleTimerMux);
+    xSemaphoreGiveFromISR(sampleTimerSemaphore, NULL);
 }
 
 // ── WiFi + Blynk ─────────────────────────────
@@ -137,7 +159,7 @@ void setup()
     Wire.begin(21, 22);
 
     pinMode(MOSFET_PIN, OUTPUT);
-    digitalWrite(MOSFET_PIN, HIGH);
+    digitalWrite(MOSFET_PIN, HIGH); // safe/idle: MOSFET active-low, HIGH keeps it off
 
     if (!ina219.begin())
     {
@@ -157,6 +179,12 @@ void setup()
 
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
+
+    // Hardware timer: fires every SAMPLE_INTERVAL ms, signals loop() via semaphore
+    sampleTimerSemaphore = xSemaphoreCreateBinary();
+    sampleTimer = timerBegin(1000000); // 1 MHz -> 1 tick = 1 microsecond
+    timerAttachInterrupt(sampleTimer, &onSampleTimer);
+    timerAlarm(sampleTimer, (uint64_t)SAMPLE_INTERVAL * 1000, true, 0);
 
     connectWiFiAndBlynk();
 
@@ -203,13 +231,13 @@ void loop()
                 discharging = true;
                 capacitymAh = 0;
                 risingCount = 0;
-                digitalWrite(MOSFET_PIN, LOW);
+                digitalWrite(MOSFET_PIN, LOW); // enable discharge path
             }
         }
         else if (cmd == 'S' || cmd == 's')
         {
             discharging = false;
-            digitalWrite(MOSFET_PIN, HIGH);
+            digitalWrite(MOSFET_PIN, HIGH); // disconnect load
         }
         else if (cmd == 'C' || cmd == 'c')
         {
@@ -237,12 +265,46 @@ void loop()
                 }
             }
         }
+        else if (cmd == 'J' || cmd == 'j')
+        {
+            uint32_t isrCountSnapshot;
+            portENTER_CRITICAL(&sampleTimerMux);
+            isrCountSnapshot = sampleIsrCount;
+            portEXIT_CRITICAL(&sampleTimerMux);
+
+            Serial.print("isr_fires: ");
+            Serial.print(isrCountSnapshot);
+            Serial.print(" samples_processed: ");
+            Serial.print(samplesProcessed);
+            Serial.print(" dropped: ");
+            Serial.print(isrCountSnapshot - samplesProcessed);
+            Serial.print(" max_jitter_ms: ");
+            Serial.println(maxJitterMs);
+        }
     }
 
-    // Sampling
-    if (millis() - lastSample >= SAMPLE_INTERVAL)
+    // Sampling: gated by the timer ISR via semaphore, not millis() polling.
+    // xSemaphoreTake with 0 timeout is non-blocking; if the timer hasn't
+    // fired since the last check, loop() falls through immediately.
+    if (xSemaphoreTake(sampleTimerSemaphore, 0) == pdTRUE)
     {
-        lastSample = millis();
+        unsigned long nowMillis = millis();
+        if (lastFireMillis != 0)
+        {
+            long jitter = (long)(nowMillis - lastFireMillis) - SAMPLE_INTERVAL;
+            long absJitter = (jitter < 0) ? -jitter : jitter;
+            if (absJitter > maxJitterMs)
+                maxJitterMs = absJitter;
+            if (absJitter > 2)
+            {
+                Serial.print("sample jitter_ms: ");
+                Serial.print(jitter);
+                Serial.print(" max_ms: ");
+                Serial.println(maxJitterMs);
+            }
+        }
+        lastFireMillis = nowMillis;
+        samplesProcessed++;
 
         float busVoltage = ina219.getBusVoltage_V();
         float shuntVoltage = ina219.getShuntVoltage_mV();
@@ -267,7 +329,7 @@ void loop()
             {
                 faultLatched = true;
                 discharging = false;
-                digitalWrite(MOSFET_PIN, HIGH); // force safe state
+                digitalWrite(MOSFET_PIN, HIGH); // force safe/idle state (active-low MOSFET)
 
                 Serial.print("FAULT LATCHED:");
                 if (faultUnderVoltage)
