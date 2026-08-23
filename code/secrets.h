@@ -1,0 +1,13 @@
+
+
+#ifndef SECRETS_H
+#define SECRETS_H
+
+#define BLYNK_TEMPLATE_ID "TMPL3llXmDJqa"
+#define BLYNK_TEMPLATE_NAME "Smart BMS"
+#define BLYNK_AUTH_TOKEN "u8yVPxaX8OqLiDyXz0GQ6p6rFfS7U-RN"
+
+#define WIFI_SSID "YOUR_WIFI_NAME"
+#define WIFI_PASS "YOUR_WIFI_PASSWORD"
+
+#endif
