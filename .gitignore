@@ -1,1 +1,6 @@
-code/secrets.h
+# Credentials: each sketch includes secrets.h from its own folder
+secrets.h
+
+# ML pipeline build output (model pickle, parity vectors, test binary)
+ml/build/
+__pycache__/
